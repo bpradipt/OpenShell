@@ -1,0 +1,298 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 Red Hat
+# SPDX-License-Identifier: Apache-2.0
+title: "OpenShift Sandboxed Containers"
+sidebar-title: "OpenShift Sandboxed Containers"
+description: "Run OpenShell sandboxes inside Kata Container VMs using OpenShift Sandboxed Containers for hardware-level isolation."
+keywords: "Generative AI, Cybersecurity, OpenShift, Sandboxed Containers, Kata Containers, SCC, Security Context Constraints, kata, VM isolation"
+position: 7
+---
+
+<Warning>
+OpenShift Sandboxed Containers support in OpenShell is experimental. Test on a non-production cluster before wider rollout.
+</Warning>
+
+OpenShift Sandboxed Containers (OSC) installs Kata Containers on OpenShift and registers `kata` RuntimeClass objects. When `default_runtime_class_name` is set in the gateway config and `force_init_container_sideload = true`, every sandbox pod is scheduled inside a Kata VM, adding a hardware isolation boundary on top of OpenShell's Landlock and egress-proxy controls.
+
+## How it works
+
+The OpenShift Sandboxed Containers operator manages the Kata runtime lifecycle on OpenShift nodes. Once the operator is installed and a `KataConfig` CR is created, it registers a `kata` RuntimeClass. The OpenShell Helm chart sets `runtimeClassName: kata` on every sandbox pod via the `server.defaultRuntimeClassName` value, and forces init-container supervisor delivery because the Kata containerd shim does not support the `ImageVolume` volume type.
+
+## Prerequisites
+
+| Prerequisite | Notes |
+|---|---|
+| OpenShift 4.x | With cluster-admin access. |
+| OpenShift Sandboxed Containers operator 1.12 | Installed and `kata` RuntimeClass available. Run `kubectl get runtimeclass` to verify. |
+| OpenShell Helm chart v0.0.54+ | `defaultRuntimeClassName` and `forceInitContainerSideload` require this version. |
+| Agent Sandbox controller and CRDs | Install before the gateway. Refer to [Install Agent Sandbox](/kubernetes/setup#install-agent-sandbox). |
+| A StorageClass | For workspace and gateway PVCs. Without one, create static PVs (see [Workaround: static PVs](#workaround-static-pvs)). |
+
+
+### Customising Kata initramfs to add veth module
+
+The default Kata initramfs shipped in OpenShift lacks the `veth` driver which is required for OpenShell.
+You'll need to build a custom initramfs for the same.
+
+- Login to the OpenShift worker node with Kata installed
+
+- Enable RW mode
+```sh
+nsenter -a -t 1
+
+ostree admin unlock --hotfix
+```
+
+- Edit dracut config file to add `veth` driver
+
+config file: `/usr/libexec/kata-containers/osbuilder/dracut/dracut.conf.d/15-dracut.conf` 
+
+Locate the network driver section:
+
+```sh
+# virtio net
+drivers+=" virtio_net "
+```
+
+Add the following line immediately after it:
+
+```sh
+# veth (virtual ethernet pairs)
+drivers+=" veth "
+```
+
+The resulting section should look like:
+
+```sh
+# virtio net
+drivers+=" virtio_net "
+
+# veth
+drivers+=" veth "
+```
+
+- Regenerate the initramfs
+
+```sh
+rm -f /var/cache/kata-containers/osbuilder-images/kata.initrd
+systemctl restart kata-osbuilder-generate.service
+```
+
+## Install
+
+<Steps>
+
+## Verify the kata RuntimeClass
+
+Confirm that the OpenShift Sandboxed Containers operator has registered the `kata` RuntimeClass:
+
+```shell
+kubectl get runtimeclass
+```
+
+If `kata` is not listed, install the OpenShift Sandboxed Containers operator and create a `KataConfig` CR first.
+
+## Create the namespace
+
+```shell
+kubectl create ns openshell
+```
+
+## Install the Agent Sandbox controller
+
+```shell
+kubectl apply -f https://raw.githubusercontent.com/nvidia/openshell/main/deploy/kube/manifests/agent-sandbox.yaml
+```
+
+## Create the OpenShell SCC
+
+The [general OpenShift install](/kubernetes/openshift) grants the `privileged` SCC to sandbox pods. This page uses a targeted SCC named `openshell-kata` that is more restrictive: it allows only the four capabilities the sandbox supervisor requires (`SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`) and `runAsUser: RunAsAny`, without granting full privileged container access.
+
+```shell
+kubectl apply -f - <<'EOF'
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: openshell-kata
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: true
+allowedCapabilities:
+  - SYS_ADMIN
+  - NET_ADMIN
+  - SYS_PTRACE
+  - SYSLOG
+defaultAddCapabilities: []
+requiredDropCapabilities: []
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - persistentVolumeClaim
+  - projected
+  - secret
+users: []
+groups: []
+EOF
+```
+
+## Grant the SCC to the gateway and sandbox service accounts
+
+The Helm chart creates two service accounts: `openshell` (gateway) and `openshell-sandbox` (sandbox pods). Grant the `openshell-kata` SCC to both:
+
+```shell
+kubectl patch scc openshell-kata \
+  --type=json \
+  -p='[
+    {"op":"add","path":"/users/-","value":"system:serviceaccount:openshell:openshell"},
+    {"op":"add","path":"/users/-","value":"system:serviceaccount:openshell:openshell-sandbox"}
+  ]'
+```
+
+## Install the Helm chart
+
+Deploy the gateway with TLS disabled, unauthenticated access (for evaluation only), the `kata` runtime class, and init-container supervisor delivery:
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set pkiInitJob.enabled=false \
+  --set server.disableTls=true \
+  --set server.auth.allowUnauthenticatedUsers=true \
+  --set server.defaultRuntimeClassName=kata \
+  --set server.forceInitContainerSideload=true \
+  --set supervisor.sideloadMethod=init-container \
+  --set podSecurityContext.fsGroup=0 \
+  --set securityContext.runAsNonRoot=false \
+  --set securityContext.runAsUser=0 \
+  --set "securityContext.capabilities.drop=[]" \
+  --set networkPolicy.enabled=false \
+  --set service.type=NodePort
+```
+
+| Override | Reason |
+|---|---|
+| `pkiInitJob.enabled=false` | The PKI init Job runs as a non-root user with a fixed UID, which the SCC admission rewrites or rejects. Disabling it skips the Job; TLS must also be disabled. |
+| `server.disableTls=true` | The gateway has no certificates without `pkiInitJob`, so it must run plaintext. |
+| `server.defaultRuntimeClassName=kata` | Sets `runtimeClassName: kata` on every sandbox pod. |
+| `server.forceInitContainerSideload=true` | Forces init-container supervisor delivery because the Kata shim does not support `ImageVolume`. |
+| `supervisor.sideloadMethod=init-container` | Selects the init-container sideload method explicitly. |
+| `podSecurityContext.fsGroup=0` / `securityContext.runAsUser=0` | Sandbox pods require root. Override the chart defaults so the SCC does not reject them. |
+| `securityContext.capabilities.drop=[]` | Clear the default `drop: [ALL]` so the required capabilities are not stripped. |
+| `networkPolicy.enabled=false` | Avoids NetworkPolicy conflicts if the cluster CNI does not support them within Kata pods. |
+| `service.type=NodePort` | Exposes the gateway on a node port for CLI registration. |
+
+## Generate and upload JWT signing keys
+
+The PKI init job normally generates JWT signing keys. With the job disabled, generate and upload them manually:
+
+```shell
+openshell-gateway generate-certs --jwt-only --out /tmp/openshell-jwt
+kubectl create secret generic openshell-jwt-keys \
+  -n openshell \
+  --from-file=signing.pem=/tmp/openshell-jwt/signing.pem \
+  --from-file=public.pem=/tmp/openshell-jwt/public.pem \
+  --from-file=kid=/tmp/openshell-jwt/kid
+kubectl -n openshell rollout restart statefulset/openshell
+```
+
+Wait for the gateway to be ready:
+
+```shell
+kubectl -n openshell rollout status statefulset/openshell
+```
+
+## Register the gateway
+
+Get the NodePort assigned to the service:
+
+```shell
+kubectl get svc openshell -n openshell
+```
+
+Register with the CLI using the node IP and NodePort:
+
+```shell
+openshell gateway add http://<node-ip>:<node-port> --name openshift-kata
+openshell status
+```
+
+## Create a sandbox and verify
+
+Create a sandbox. The gateway applies `runtimeClassName: kata` automatically:
+
+```shell
+openshell sandbox create --name my-sandbox
+```
+
+Confirm the pod uses the kata runtime:
+
+```shell
+kubectl get pod my-sandbox -n openshell \
+  -o jsonpath='{.spec.runtimeClassName}'
+# kata
+```
+
+</Steps>
+
+## Workaround: static PVs
+
+If no StorageClass is configured, create a static PV for each sandbox workspace. The hostPath directory must have the `container_file_t` SELinux label so the Kata VM can write to it.
+
+Fix the SELinux context on the target node:
+
+```shell
+kubectl run selinux-fix -n openshell \
+  --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
+  --restart=Never \
+  --overrides='{
+    "spec":{
+      "nodeName":"<node-name>",
+      "volumes":[{"name":"host","hostPath":{"path":"/","type":""}}],
+      "containers":[{
+        "name":"fix","image":"registry.access.redhat.com/ubi9/ubi-minimal:latest",
+        "command":["sh","-c","mkdir -p /host/var/openshell/workspace && chmod 1777 /host/var/openshell/workspace && chcon -Rt container_file_t /host/var/openshell/workspace && echo done"],
+        "volumeMounts":[{"name":"host","mountPath":"/host"}],
+        "securityContext":{"privileged":true,"runAsUser":0}
+      }]
+    }
+  }' && \
+kubectl wait --for=condition=Succeeded pod/selinux-fix -n openshell --timeout=30s && \
+kubectl delete pod selinux-fix -n openshell
+```
+
+Create a static PV:
+
+```shell
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: openshell-workspace-pv
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /var/openshell/workspace
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - <node-name>
+EOF
+```

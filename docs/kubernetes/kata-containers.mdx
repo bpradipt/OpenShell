@@ -1,0 +1,193 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 Red Hat
+# SPDX-License-Identifier: Apache-2.0
+title: "Kata Containers"
+sidebar-title: "Kata Containers"
+description: "Run OpenShell sandboxes inside Kata Container VMs on an existing Kubernetes cluster for hardware-level isolation."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Kata Containers, VM isolation, runtimeClassName, kata-qemu, sandbox policy"
+position: 6
+---
+
+<Warning>
+Kata Containers support in OpenShell is experimental. Test on a non-production cluster before wider rollout.
+</Warning>
+
+Kata Containers runs each pod inside a lightweight virtual machine instead of a container namespace on the host kernel. When OpenShell sandboxes run under `kata-qemu`, the sandbox supervisor and the agent workload execute inside that VM, giving an additional isolation boundary beyond what Linux namespaces and Landlock provide on their own.
+
+<img src="./kata-demo.gif" alt="OpenShell sandbox running as a Kata VM pod with network policy enforcement" />
+
+## How it works
+
+OpenShell's Kubernetes driver schedules sandbox pods by creating `Sandbox` custom resources. Setting `runtimeClassName: kata-qemu` on the pod spec tells the kubelet to hand the pod to the Kata containerd shim, which boots a QEMU microVM and runs the pod inside it. The OpenShell gateway and supervisor are unaware of the VM boundary — the supervisor connects back to the gateway over the same gRPC channel it would use in a regular pod.
+
+Two gateway config fields enable this cluster-wide without requiring per-sandbox flags:
+
+| Field | Purpose |
+|---|---|
+| `default_runtime_class_name` | Applied as `runtimeClassName` on every sandbox pod that does not specify its own. |
+| `force_init_container_sideload` | Forces the init-container supervisor delivery method. Required because the `ImageVolume` volume type is not yet supported by the `kata-qemu` containerd shim. |
+
+## Prerequisites
+
+| Prerequisite | Notes |
+|---|---|
+| Kubernetes 1.29+ cluster | With RBAC enabled. |
+| Kata Containers installed on cluster nodes | The kata-qemu runtimeClass must be configured. See [Kata Containers install guide](https://github.com/kata-containers/kata-containers/tree/main/docs/install). |
+| `kata-qemu` RuntimeClass object | Created in the cluster (see below). |
+| OpenShell gateway v0.0.53+ | Running outside the cluster or as a Helm deployment with access to the Kubernetes API. |
+| Agent Sandbox controller and CRDs | Install before the gateway. Refer to [Install Agent Sandbox](/kubernetes/setup#install-agent-sandbox). |
+
+## Install
+
+<Steps>
+
+## Verify Kata is available on your nodes
+
+Check that the kata-qemu containerd runtime is registered:
+
+```shell
+kubectl get runtimeclass
+```
+
+If `kata-qemu` is not listed, follow the [Kata Containers install guide](https://github.com/kata-containers/kata-containers/tree/main/docs/install) for your cluster.
+
+## Verify a Kata pod starts
+
+Run a one-shot pod to confirm the runtime works on your cluster before configuring OpenShell:
+
+```shell
+kubectl run kata-smoke --image=alpine:3.20 --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"kata-qemu"}}' \
+  -- uname -r
+kubectl wait --for=condition=Completed pod/kata-smoke --timeout=60s
+kubectl logs kata-smoke   # should print the Kata VM kernel, not the host kernel
+kubectl delete pod kata-smoke
+```
+
+The kernel version printed by `uname -r` inside the pod should differ from the host kernel, confirming the pod ran inside a Kata VM.
+
+## Configure the OpenShell gateway
+
+Add the following to your `gateway.toml`. The `host_gateway_ip` must be reachable from inside the Kata VM — use the cluster node IP or a stable service IP, not `127.0.0.1`:
+
+```toml
+[openshell.drivers.kubernetes]
+namespace                     = "openshell"
+host_gateway_ip               = "<node-ip>"
+grpc_endpoint                 = "http://<node-ip>:18080"
+default_runtime_class_name    = "kata-qemu"
+force_init_container_sideload = true
+```
+
+`force_init_container_sideload = true` makes the gateway copy the supervisor binary via an init container rather than mounting it as an image volume. The `ImageVolume` volume type is not yet supported by the kata containerd shim.
+
+## Start the gateway with Kubernetes API access enabled
+
+When the gateway runs outside the cluster, set `KUBERNETES_SERVICE_HOST` so the gateway registers its ServiceAccount bootstrap authenticator. Without it, sandbox pods cannot exchange their projected ServiceAccount tokens for gateway JWTs and fail to start.
+
+```shell
+export KUBERNETES_SERVICE_HOST=<api-server-ip>
+export KUBERNETES_SERVICE_PORT=6443
+export KUBECONFIG=/path/to/kubeconfig
+export OPENSHELL_BIND_ADDRESS=0.0.0.0   # pods reach the gateway via node IP, not loopback
+
+openshell-gateway \
+  --config gateway.toml \
+  --port 18080 \
+  --drivers kubernetes \
+  --disable-tls \
+  --db-url sqlite:gateway.db?mode=rwc
+```
+
+If the gateway runs as a Helm deployment inside the cluster, `KUBERNETES_SERVICE_HOST` is set automatically by kubelet and `OPENSHELL_BIND_ADDRESS` defaults to `0.0.0.0`. No extra configuration is needed for in-cluster deployments.
+
+## Register the gateway and create a sandbox
+
+```shell
+openshell gateway add http://127.0.0.1:18080 --local --name kata-dev
+openshell status
+```
+
+Create a sandbox. The gateway applies `runtimeClassName: kata-qemu` automatically because `default_runtime_class_name` is set:
+
+```shell
+openshell sandbox create --name my-sandbox
+```
+
+Confirm the pod is using the Kata runtime:
+
+```shell
+kubectl get pod my-sandbox -n openshell \
+  -o jsonpath='{.spec.runtimeClassName}'
+# kata-qemu
+```
+
+</Steps>
+
+## Verify VM isolation
+
+The Kata VM runs its own kernel. Compare the kernel version inside the sandbox with the host:
+
+```shell
+# Host kernel
+uname -r
+# e.g. 6.8.0-106-generic
+
+# Sandbox kernel (via OpenShell logs)
+openshell logs my-sandbox --source sandbox | grep CONFIG:PROBED
+# CONFIG:PROBED [INFO] Landlock filesystem sandbox available [abi:v7 compat:BestEffort ...]
+```
+
+A higher Landlock ABI version than the host kernel, or a different kernel version string in the logs, confirms the sandbox is running inside the Kata VM.
+
+## Network policy enforcement
+
+Policy enforcement works identically to any other OpenShell sandbox. Sandboxes start with default-deny outbound access. Apply a policy to open specific routes.
+
+Attempt a request before applying any policy:
+
+```shell
+openshell sandbox connect my-sandbox -- curl -sS https://api.github.com/zen
+# curl: (56) CONNECT tunnel failed, response 403
+```
+
+Apply a read-only GitHub API policy:
+
+```shell
+openshell policy set my-sandbox \
+  --policy examples/sandbox-policy-quickstart/policy.yaml \
+  --wait
+```
+
+Retry the GET request — it is now allowed. A POST to the same host is blocked at the L7 layer:
+
+```shell
+openshell sandbox connect my-sandbox -- curl -sS https://api.github.com/zen
+# Anything added dilutes everything else.
+
+openshell sandbox connect my-sandbox -- \
+  curl -sS -X POST https://api.github.com/repos/octocat/hello-world/issues \
+  -d '{"title":"oops"}'
+# {"error":"policy_denied","detail":"POST /repos/octocat/hello-world/issues not permitted by policy"}
+```
+
+Policy updates are hot-reloaded inside the Kata VM without restarting the pod. The `--wait` flag blocks until the sandbox confirms the new policy is active.
+
+## Troubleshooting
+
+**`IssueSandboxToken bootstrap exchange failed` in pod logs**
+
+The gateway does not have its Kubernetes ServiceAccount authenticator enabled. Make sure `KUBERNETES_SERVICE_HOST` is set in the gateway process environment when running outside the cluster.
+
+**Pod stays `Pending` with `RuntimeClass not found`**
+
+The `kata-qemu` RuntimeClass does not exist on the cluster, or the containerd shim is not installed on the node where the pod was scheduled. Run `kubectl get runtimeclass` and verify all nodes have the Kata shim installed.
+
+**Pod starts but supervisor cannot connect to gateway**
+
+The sandbox reaches the gateway at `host_gateway_ip`. If the gateway is bound to `127.0.0.1`, pods cannot reach it. Set `OPENSHELL_BIND_ADDRESS=0.0.0.0` and ensure `host_gateway_ip` in `gateway.toml` points to the node's LAN IP, not loopback.
+
+**`ImageVolume` volume type errors in events**
+
+`force_init_container_sideload` is not set to `true`. The default `ImageVolume` sideload method is not supported by the kata containerd shim. Add `force_init_container_sideload = true` under `[openshell.drivers.kubernetes]` in `gateway.toml`.
+
