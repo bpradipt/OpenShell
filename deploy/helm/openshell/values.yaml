@@ -155,6 +155,14 @@ server:
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # -- Default runtimeClassName applied to every sandbox pod. Set to "kata" or
+  # "kata-qemu" when running on a Kata Containers cluster for VM-level isolation.
+  # Empty = no runtimeClassName (uses cluster default).
+  defaultRuntimeClassName: ""
+  # -- Force the init-container supervisor delivery method. Required for Kata
+  # Containers because the ImageVolume volume type is not supported by the
+  # kata containerd shim.
+  forceInitContainerSideload: false
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

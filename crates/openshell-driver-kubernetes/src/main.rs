@@ -115,6 +115,8 @@ async fn main() -> Result<()> {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
         sa_token_ttl_secs: args.sa_token_ttl_secs,
+        default_runtime_class_name: None,
+        force_init_container_sideload: false,
     })
     .await
     .into_diagnostic()?;

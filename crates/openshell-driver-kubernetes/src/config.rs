@@ -83,6 +83,15 @@ pub struct KubernetesComputeConfig {
     /// this token within a few seconds of pod start, so any value at
     /// the floor is sufficient. Default 3600.
     pub sa_token_ttl_secs: i64,
+    /// Default `runtimeClassName` applied to every sandbox pod that does not
+    /// specify its own via `SandboxTemplate.runtime_class_name`.
+    /// Set to `"kata-qemu"` to route all sandboxes through Kata Containers.
+    pub default_runtime_class_name: Option<String>,
+    /// When true, always use the init-container supervisor sideload method
+    /// regardless of the cluster's Kubernetes version.  Required for Kata
+    /// runtimes because the `ImageVolume` volume type is not yet supported by
+    /// the kata-qemu containerd shim.
+    pub force_init_container_sideload: bool,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -114,6 +123,8 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             sa_token_ttl_secs: 3600,
+            default_runtime_class_name: None,
+            force_init_container_sideload: false,
         }
     }
 }

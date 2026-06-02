@@ -319,7 +319,11 @@ impl KubernetesComputeDriver {
             image_pull_policy: &self.config.image_pull_policy,
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
-            supervisor_sideload_method: self.config.supervisor_sideload_method,
+            supervisor_sideload_method: if self.config.force_init_container_sideload {
+                SupervisorSideloadMethod::InitContainer
+            } else {
+                self.config.supervisor_sideload_method
+            },
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -330,6 +334,7 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+            default_runtime_class_name: self.config.default_runtime_class_name.clone(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -1061,6 +1066,9 @@ struct SandboxPodParams<'a> {
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
     sa_token_ttl_secs: i64,
+    /// Cluster-level default `runtimeClassName`; applied when the sandbox
+    /// template does not specify one.
+    default_runtime_class_name: Option<String>,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -1081,6 +1089,7 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             sa_token_ttl_secs: 3600,
+            default_runtime_class_name: None,
         }
     }
 }
@@ -1200,11 +1209,10 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    if let Some(runtime_class) = platform_config_string(template, "runtime_class_name") {
-        spec.insert(
-            "runtimeClassName".to_string(),
-            serde_json::json!(runtime_class),
-        );
+    let runtime_class = platform_config_string(template, "runtime_class_name")
+        .or_else(|| params.default_runtime_class_name.clone());
+    if let Some(rc) = runtime_class {
+        spec.insert("runtimeClassName".to_string(), serde_json::json!(rc));
     }
     if let Some(node_selector) = platform_config_struct(template, "node_selector") {
         spec.insert("nodeSelector".to_string(), node_selector);
